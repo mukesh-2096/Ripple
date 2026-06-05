@@ -1,8 +1,4 @@
 package proxy
-/*
-Copyright © 2026 NAME HERE <EMAIL ADDRESS>
-*/
-package proxy
 
 import (
 	"net/url"

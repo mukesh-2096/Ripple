@@ -4,12 +4,17 @@ Copyright © 2026 NAME HERE <EMAIL ADDRESS>
 package cmd
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/your-username/shadow-client/pkg/proxy"
 	"github.com/your-username/shadow-client/types"
 )
 
@@ -96,13 +101,156 @@ Example:
 			"packet_loss", config.Profile.PacketLoss,
 		)
 
-		// Placeholder for actual comparison logic
-		fmt.Printf("Ripple comparison started\n")
-		fmt.Printf("Target A: %s\n", config.TargetA)
-		fmt.Printf("Target B: %s\n", config.TargetB)
-		fmt.Printf("Profile: %s (%s)\n", config.Profile.Name, config.Profile.Description)
-		fmt.Printf("Latency: %v, Jitter: %v, Packet Loss: %.2f%%\n",
-			config.Profile.Latency, config.Profile.Jitter, config.Profile.PacketLoss)
+		// Create proxy manager pointing to default Toxiproxy URL
+		pm := proxy.NewProxyManager("http://localhost:8474")
+
+		// Initialize proxies (dynamically allocates ports)
+		slog.Info("Initializing Toxiproxy proxies...")
+		if err := pm.InitializeProxies(config); err != nil {
+			slog.Error("Failed to initialize proxies", "error", err)
+			return fmt.Errorf("proxy initialization failed: %w", err)
+		}
+		// Ensure cleanup is deferred
+		defer func() {
+			slog.Info("Cleaning up proxies...")
+			if err := pm.Cleanup(); err != nil {
+				slog.Warn("Failed to cleanup proxies", "error", err)
+			}
+		}()
+
+		// Apply network profile (latency, jitter, bandwidth, packet loss)
+		slog.Info("Applying network profile to proxies...", "profile", config.Profile.Name)
+		if err := pm.ApplyNetworkProfile(config.Profile); err != nil {
+			slog.Error("Failed to apply network profile", "error", err)
+			return fmt.Errorf("failed to apply network profile: %w", err)
+		}
+
+		// Retrieve proxy URLs to execute the requests
+		proxyUrlA, err := pm.GetProxyURL("target-a")
+		if err != nil {
+			return fmt.Errorf("failed to get proxy URL for target-a: %w", err)
+		}
+		proxyUrlB, err := pm.GetProxyURL("target-b")
+		if err != nil {
+			return fmt.Errorf("failed to get proxy URL for target-b: %w", err)
+		}
+
+		slog.Info("Routing outbound requests through Toxiproxy...",
+			"proxy_a", proxyUrlA,
+			"proxy_b", proxyUrlB,
+		)
+
+		// Create HTTP Client with a timeout exceeding maximum profile latency (e.g., 30s)
+		client := &http.Client{
+			Timeout: 30 * time.Second,
+		}
+
+		type reqResult struct {
+			target   string
+			duration time.Duration
+			body     []byte
+			status   int
+			err      error
+		}
+
+		resultsChan := make(chan reqResult, 2)
+
+		// Trigger concurrent requests
+		slog.Info("Firing concurrent requests through proxies...")
+		fireRequest := func(targetName, urlStr string) {
+			startTime := time.Now()
+			req, err := http.NewRequest("GET", urlStr, nil)
+			if err != nil {
+				resultsChan <- reqResult{target: targetName, err: err}
+				return
+			}
+
+			resp, err := client.Do(req)
+			duration := time.Since(startTime)
+			if err != nil {
+				resultsChan <- reqResult{target: targetName, duration: duration, err: err}
+				return
+			}
+			defer resp.Body.Close()
+
+			bodyBytes, err := io.ReadAll(resp.Body)
+			resultsChan <- reqResult{
+				target:   targetName,
+				duration: duration,
+				body:     bodyBytes,
+				status:   resp.StatusCode,
+				err:      err,
+			}
+		}
+
+		go fireRequest("Target A", proxyUrlA)
+		go fireRequest("Target B", proxyUrlB)
+
+		var resA, resB reqResult
+		for i := 0; i < 2; i++ {
+			res := <-resultsChan
+			if res.target == "Target A" {
+				resA = res
+			} else {
+				resB = res
+			}
+		}
+
+		// Display performance stats
+		fmt.Println("\n==================================================")
+		fmt.Println("             RIPPLE EXECUTION REPORT              ")
+		fmt.Println("==================================================")
+		fmt.Printf("Profile Applied: %s (%s)\n", config.Profile.Name, config.Profile.Description)
+		fmt.Printf("Latency Profile: %v (Jitter: %v, Loss: %.1f%%, Bandwidth: %d Bps)\n\n",
+			config.Profile.Latency, config.Profile.Jitter, config.Profile.PacketLoss, config.Profile.Bandwidth)
+
+		// Print Target A results
+		if resA.err != nil {
+			fmt.Printf("🔴 Target A [%s]: FAILED\n   Error: %v\n", config.TargetA, resA.err)
+		} else {
+			fmt.Printf("🟢 Target A [%s]:\n   Status:   %d OK\n   Latency:  %v\n   Bytes:    %d\n",
+				config.TargetA, resA.status, resA.duration, len(resA.body))
+		}
+
+		fmt.Println()
+
+		// Print Target B results
+		if resB.err != nil {
+			fmt.Printf("🔴 Target B [%s]: FAILED\n   Error: %v\n", config.TargetB, resB.err)
+		} else {
+			fmt.Printf("🟢 Target B [%s]:\n   Status:   %d OK\n   Latency:  %v\n   Bytes:    %d\n",
+				config.TargetB, resB.status, resB.duration, len(resB.body))
+		}
+
+		fmt.Println("==================================================")
+
+		// Payload Diff Comparison
+		if resA.err == nil && resB.err == nil {
+			fmt.Println("Payload Match Check:")
+			if bytes.Equal(resA.body, resB.body) {
+				fmt.Println("  ✓ JSON Payloads match exactly!")
+			} else {
+				fmt.Println("  ✗ JSON Payloads differ.")
+				// Fallback to simple string display or unmarshaled comparison
+				var valA, valB interface{}
+				errA := json.Unmarshal(resA.body, &valA)
+				errB := json.Unmarshal(resB.body, &valB)
+				if errA == nil && errB == nil {
+					if fmt.Sprintf("%v", valA) == fmt.Sprintf("%v", valB) {
+						fmt.Println("  ✓ Unmarshaled JSON payloads are structurally identical.")
+					} else {
+						fmt.Println("  [Warning] Responses have data mismatches.")
+						if config.Verbose {
+							fmt.Printf("  Target A response: %s\n", string(resA.body))
+							fmt.Printf("  Target B response: %s\n", string(resB.body))
+						}
+					}
+				} else {
+					fmt.Println("  [Non-JSON or unparseable payload comparison]")
+				}
+			}
+		}
+		fmt.Println("==================================================")
 
 		return nil
 	},

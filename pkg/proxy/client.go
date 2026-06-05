@@ -38,23 +38,23 @@ func (pm *ProxyManager) InitializeProxies(config *types.ShadowConfig) error {
 		return fmt.Errorf("invalid target-b URL: %w", err)
 	}
 
-	// Find free ports for proxies
+	// Find free ports for proxies in the Docker exposed range
 	portA, err := findFreePort()
 	if err != nil {
 		return fmt.Errorf("could not find free port for target-a proxy: %w", err)
 	}
 
-	portB, err := findFreePort()
+	portB, err := findFreePort(portA)
 	if err != nil {
 		return fmt.Errorf("could not find free port for target-b proxy: %w", err)
 	}
 
-	// Create proxy targets
+	// Create proxy targets (ListenSocket binds to 0.0.0.0 so host can access it through Docker mappings)
 	pm.TargetA = &ProxyTarget{
 		Name:           "target-a",
 		OriginalURL:    config.TargetA,
 		ParsedURL:      urlA,
-		ListenSocket:   fmt.Sprintf("127.0.0.1:%d", portA),
+		ListenSocket:   fmt.Sprintf("0.0.0.0:%d", portA),
 		UpstreamSocket: net.JoinHostPort(urlA.Hostname(), getPort(urlA)),
 		ProxyName:      "shadow-client-target-a",
 	}
@@ -63,7 +63,7 @@ func (pm *ProxyManager) InitializeProxies(config *types.ShadowConfig) error {
 		Name:           "target-b",
 		OriginalURL:    config.TargetB,
 		ParsedURL:      urlB,
-		ListenSocket:   fmt.Sprintf("127.0.0.1:%d", portB),
+		ListenSocket:   fmt.Sprintf("0.0.0.0:%d", portB),
 		UpstreamSocket: net.JoinHostPort(urlB.Hostname(), getPort(urlB)),
 		ProxyName:      "shadow-client-target-b",
 	}
@@ -79,13 +79,10 @@ func (pm *ProxyManager) InitializeProxies(config *types.ShadowConfig) error {
 		return fmt.Errorf("failed to create proxy for target-b: %w", err)
 	}
 
-	// Update proxy URLs
+	// Update proxy URLs using localhost/127.0.0.1 so host can reach them
 	scheme := "http"
-	if urlA.Scheme == "https" {
-		scheme = "http" // Toxiproxy always exposes as http
-	}
-	pm.TargetA.ProxyURL = fmt.Sprintf("%s://%s%s", scheme, pm.TargetA.ListenSocket, urlA.Path)
-	pm.TargetB.ProxyURL = fmt.Sprintf("%s://%s%s", scheme, pm.TargetB.ListenSocket, urlB.Path)
+	pm.TargetA.ProxyURL = fmt.Sprintf("%s://127.0.0.1:%d%s", scheme, portA, urlA.Path)
+	pm.TargetB.ProxyURL = fmt.Sprintf("%s://127.0.0.1:%d%s", scheme, portB, urlB.Path)
 
 	slog.Info("Proxies initialized",
 		"target_a_listen", pm.TargetA.ListenSocket,
@@ -133,12 +130,12 @@ func (pm *ProxyManager) ApplyNetworkProfile(profile types.NetworkProfile) error 
 	// Apply bandwidth limit
 	if profile.Bandwidth > 0 {
 		bandwidthToxic := &ToxicConfig{
-			Name:     "bandwidth_limit",
-			Type:     "bandwidth_limit",
+			Name:     "bandwidth",
+			Type:     "bandwidth",
 			Stream:   "upstream",
 			Toxicity: 1.0,
 			Attributes: map[string]interface{}{
-				"rate": profile.Bandwidth,
+				"rate": profile.Bandwidth / 1024, // Toxiproxy expects rate in KB/s
 			},
 		}
 
@@ -155,15 +152,15 @@ func (pm *ProxyManager) ApplyNetworkProfile(profile types.NetworkProfile) error 
 		slog.Debug("Applied bandwidth limit toxic", "rate_bps", profile.Bandwidth)
 	}
 
-	// Apply packet loss (if non-zero)
+	// Apply packet loss (simulated using Toxiproxy's timeout toxic with fractional toxicity)
 	if profile.PacketLoss > 0 {
 		packetLossToxic := &ToxicConfig{
 			Name:     "packet_loss",
-			Type:     "packet_loss",
+			Type:     "timeout",
 			Stream:   "upstream",
-			Toxicity: 1.0,
+			Toxicity: profile.PacketLoss / 100.0, // Convert percentage (0-100) to fraction (0.0-1.0)
 			Attributes: map[string]interface{}{
-				"percentage": profile.PacketLoss,
+				"timeout": 0, // 0 means drop the connection / block forever
 			},
 		}
 
@@ -177,7 +174,7 @@ func (pm *ProxyManager) ApplyNetworkProfile(profile types.NetworkProfile) error 
 			return err
 		}
 
-		slog.Debug("Applied packet loss toxic", "percentage", profile.PacketLoss)
+		slog.Debug("Applied packet loss (timeout) toxic", "drop_probability", profile.PacketLoss/100.0)
 	}
 
 	return nil
@@ -375,19 +372,27 @@ func (pm *ProxyManager) removeToxicsFromProxy(proxyName string) error {
 
 // Helper functions
 
-// findFreePort finds an available TCP port.
-func findFreePort() (int, error) {
-	listener, err := net.ListenTCP("tcp", &net.TCPAddr{
-		Port: 0,
-		IP:   net.ParseIP("127.0.0.1"),
-	})
-	if err != nil {
-		return 0, err
+// findFreePort finds an available TCP port in the range 8000-8100 (Docker exposed range).
+func findFreePort(exclude ...int) (int, error) {
+	excludeMap := make(map[int]bool)
+	for _, p := range exclude {
+		excludeMap[p] = true
 	}
-	defer listener.Close()
 
-	port := listener.Addr().(*net.TCPAddr).Port
-	return port, nil
+	for port := 8000; port <= 8100; port++ {
+		if excludeMap[port] {
+			continue
+		}
+		listener, err := net.ListenTCP("tcp", &net.TCPAddr{
+			Port: port,
+			IP:   net.ParseIP("127.0.0.1"),
+		})
+		if err == nil {
+			listener.Close()
+			return port, nil
+		}
+	}
+	return 0, fmt.Errorf("no free ports in range 8000-8100")
 }
 
 // getPort extracts the port from a URL, returning the default for the scheme if not specified.
